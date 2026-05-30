@@ -1,260 +1,171 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from scipy.stats import norm
 
 # ==========================================
-# 1. 页面基本配置
+# 1. 核心参数与基础设定
 # ==========================================
-st.set_page_config(
-    page_title="永辉超市生鲜肉禽区补货系统长期绩效仿真沙盘",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="零售库存仿真仪表盘", layout="wide")
+st.title("永辉超市生鲜区：库存与服务水平动态仿真沙盘")
 
-st.title("📊 永辉超市生鲜肉禽区补货系统长期绩效仿真沙盘 (Final)")
-st.markdown("本系统严格基于展示2静态模型参数构建，通过多周期动态蒙特卡洛仿真评估随机需求及不确定性下的系统表现。")
+# 侧边栏：交互输入控制
+st.sidebar.header("仿真参数控制面板")
+target_sl = st.sidebar.slider("目标服务水平 (SL)", 0.80, 0.99, 0.95, 0.01)
+freq_options = {"2次/天": 2, "3次/天": 3}
+freq_choice = st.sidebar.radio("补货频率 (f)", list(freq_options.keys()), index=1)
+f = freq_options[freq_choice]
 
-# ==========================================
-# 2. 侧边栏交互参数输入 (控制面板)
-# ==========================================
-st.sidebar.header("⚙️ 运营控制面板")
+extreme_volatility = st.sidebar.checkbox("引入极端周末波动", value=True)
 
-# 核心决策变量 1：目标服务水平
-target_sl = st.sidebar.slider(
-    "1. 目标服务水平 (Target Service Level)",
-    min_value=0.90, max_value=0.99, value=0.95, step=0.01,
-    help="对应静态报童模型中的服务水平承诺"
-)
-
-# 核心决策变量 2：补货频率
-replenish_freq = st.sidebar.selectbox(
-    "2. 每日补货频率 (Replenishment Frequency)",
-    options=[2, 3],
-    index=1, # 默认选择每日 3 次
-    format_func=lambda x: f"每日 {x} 次 (f = {x})"
-)
-
-# 不确定性引入：极端周末波动开关
-weekend_volatility = st.sidebar.toggle(
-    "3. 引入极端周末波动 (压力测试)",
-    value=True,
-    help="开启后，周六周日的需求均值将飙升至1500，标准差放大至500"
-)
-
-# 随机种子设定，确保结果可复现但又具备随机性
-random_seed = st.sidebar.number_input("随机数种子 (Seed)", value=42, step=1)
+# 固定常量设定
+DAYS = 365
+L = 1  # 提前期 1天
+MAX_CAPACITY = 800  # 物理库容上限
+UNIT_MARGIN = 12.5  # 单件毛利预估
+UNIT_STOCKOUT_PENALTY = 6.82
+DELIVERY_COST = 30
+BASE_MEAN = 1200
+BASE_STD = 360
 
 # ==========================================
-# 3. 核心运营基础参数定义 (严格对照Pre2成果)
+# 2. 蒙特卡洛仿真引擎
 # ==========================================
-BASE_MEAN = 1200          # 基础日均需求
-BASE_STD = 360            # 基础需求标准差
-WEEKEND_MEAN = 1500       # 周末日均需求
-WEEKEND_STD = 500         # 周末需求标准差
+@st.cache_data
+def run_simulation(sl, freq, extreme_vol):
+    np.random.seed(42) # 保证每次调整参数时结果可重现对比
 
-UNIT_MARGIN = 12.5        # 单件商品销售毛利 (元)
-STOCKOUT_PENALTY = 6.82   # 单件缺货损失成本 (元)
-COST_PER_DELIVERY = 30.0  # 单次物流配送成本 (元)
+    # 动态计算不同频率下的安全库存和目标库存上限 (Order-up-to level)
+    # R: 补货周期，T: 保护期 (R+L)
+    R_days = 1 / freq
+    T_days = R_days + L
+    z_val = norm.ppf(sl)
 
-CAPACITY_LIMIT = 800      # 物理库容上限 (红线)
-WARNING_LIMIT = 683       # 生物学预警上限 (黄线/安全库存上限)
-BASE_HOLDING_COST_YEAR = 12.5 # 基准年化单件持有成本 (对应静态25%税率折算)
-BASE_HOLDING_COST_DAY = BASE_HOLDING_COST_YEAR / 365.0
+    # 假设每日需求在各个补货周期内均匀分布
+    cycle_mean = BASE_MEAN * R_days
+    cycle_std = BASE_STD * np.sqrt(R_days)
 
-# ==========================================
-# 4. 蒙特卡洛动态循环仿真引擎
-# ==========================================
-@st.cache_data(show_spinner="核心仿真引擎计算中...")
-def run_inventory_simulation(sl, f, introduce_weekend, seed):
-    np.random.seed(seed)
+    # 理论安全库存 (以天为维度折算)
+    SS = z_val * BASE_STD * np.sqrt(T_days)
+    order_up_to = BASE_MEAN * T_days + SS
 
-    # 全年模拟 365 天，将其切分为 365 * f 个补货周期
-    total_days = 365
-    total_periods = total_days * f
-    lead_time_periods = f  # 前置时间 L = 1 天 = f 个周期
-    review_period = 1       # 每 1 个周期盘点并触发补货一次
-    protection_periods = review_period + lead_time_periods # 保护期 = 1 + f 周期
+    # 初始化记录数组
+    inventory_levels = np.zeros(DAYS)
+    stockout_units_arr = np.zeros(DAYS)
+    holding_costs_arr = np.zeros(DAYS)
+    daily_demand_arr = np.zeros(DAYS)
 
-    # 计算当前策略下的安全库存(SS)与补货目标点(S)
-    z_score = norm.ppf(sl)
+    current_inventory = order_up_to  # 初始库存满载
+    pipeline_orders = np.zeros(L + 1) # 在途订单队列
 
-    # 数组初始化，用于记录仿真轨迹
-    period_demand = np.zeros(total_periods)
-    period_ending_inventory = np.zeros(total_periods)
-    period_stockout = np.zeros(total_periods)
-    period_sales = np.zeros(total_periods)
-    period_holding_cost = np.zeros(total_periods)
-    period_order_qty = np.zeros(total_periods)
-
-    # 在途订单流水线：记录每个周期预计送达的货量
-    in_transit = np.zeros(total_periods + lead_time_periods + 1)
-
-    # 系统的初始库存设为补货目标水平的一半
-    current_physical_inv = 400
-
-    # 开始 365 * f 周期滚动迭代
-    for t in range(total_periods):
-        current_day = t // f
-        is_weekend = (current_day % 7 == 5) or (current_day % 7 == 6) # 第5, 6天为周末
-
-        # 确定当前周期的随机需求参数
-        if introduce_weekend and is_weekend:
-            mu_p = WEEKEND_MEAN / f
-            sigma_p = WEEKEND_STD / np.sqrt(f)
+    for day in range(DAYS):
+        # 1. 生成当天随机需求
+        is_weekend = (day % 7 == 5) or (day % 7 == 6)
+        if extreme_vol and is_weekend:
+            daily_demand = np.random.normal(1500, 500)
         else:
-            mu_p = BASE_MEAN / f
-            sigma_p = BASE_STD / np.sqrt(f)
+            daily_demand = np.random.normal(BASE_MEAN, BASE_STD)
+        daily_demand = max(0, daily_demand)
+        daily_demand_arr[day] = daily_demand
 
-        # 生成当前周期真实的随机需求 (截断正态分布，确保不为负数)
-        demand = max(0.0, np.random.normal(mu_p, sigma_p))
-        period_demand[t] = demand
+        # 2. 接收在途订单 (简单按天结算)
+        arrived_order = pipeline_orders[0]
+        pipeline_orders[:-1] = pipeline_orders[1:]
+        pipeline_orders[-1] = 0
+        current_inventory += arrived_order
 
-        # 1. 期初到货入库
-        arrival_qty = in_transit[t]
-        current_physical_inv += arrival_qty
-
-        # 2. 需求实现与库存扣减
-        if current_physical_inv >= demand:
-            sales = demand
-            stockout = 0.0
-            current_physical_inv -= demand
+        # 3. 满足需求与缺货统计
+        if current_inventory >= daily_demand:
+            current_inventory -= daily_demand
+            stockout_units = 0
         else:
-            sales = current_physical_inv
-            stockout = demand - current_physical_inv
-            current_physical_inv = 0.0
+            stockout_units = daily_demand - current_inventory
+            current_inventory = 0
 
-        period_sales[t] = sales
-        period_stockout[t] = stockout
-        period_ending_inventory[t] = current_physical_inv
+        stockout_units_arr[day] = stockout_units
+        inventory_levels[day] = current_inventory
 
-        # 3. 动态结算当前的非线性阶梯持有成本 (对应展示2核心公式)
-        # 将周期末库存乘以频次外推到日规模，进而判断落入哪个阶梯区间
-        equivalent_daily_inv = current_physical_inv * f
-        if equivalent_daily_inv <= WARNING_LIMIT:
-            multiplier = 1.0   # 舒适区：保持基准年化25%损耗率
-        elif equivalent_daily_inv <= CAPACITY_LIMIT:
-            multiplier = 1.2   # 预警区：损耗率攀升至30% (成本放大1.2倍)
+        # 4. 阶梯非线性持有成本结算
+        if current_inventory <= 683:
+            holding_cost = current_inventory * (0.25 * 50 / 365)
+        elif current_inventory <= 800:
+            holding_cost = current_inventory * (0.30 * 50 / 365)
         else:
-            multiplier = 1.4   # 爆仓区：损耗率高达35% (成本惩罚性放大1.4倍)
+            holding_cost = current_inventory * (0.35 * 50 / 365)
 
-        # 单周期的持有成本
-        period_holding_cost[t] = current_physical_inv * (BASE_HOLDING_COST_DAY / f) * multiplier
+        holding_costs_arr[day] = holding_cost
 
-        # 4. 周期末自动盘点并发出补货决策 (Order-up-to 机制)
-        # 动态计算当前保护期内的期望需求和波动
-        mu_protection = mu_p * protection_periods
-        sigma_protection = sigma_p * np.sqrt(protection_periods)
-        S_target = mu_protection + z_score * sigma_protection
+        # 5. 期末制定补货决策 (简单的基准库存策略)
+        inventory_position = current_inventory + sum(pipeline_orders)
+        order_qty = max(0, order_up_to - inventory_position)
+        pipeline_orders[-1] = order_qty
 
-        # 计算当前的库存位置 (物理库存 + 所有在途未到达的订单)
-        future_arrivals = sum(in_transit[t+1 : t+1+lead_time_periods])
-        inventory_position = current_physical_inv + future_arrivals
+    # 汇总KPI
+    total_demand = np.sum(daily_demand_arr)
+    total_stockout = np.sum(stockout_units_arr)
+    actual_sl = 1 - (total_stockout / total_demand) if total_demand > 0 else 0
 
-        # 发出补货订单
-        order_qty = max(0.0, S_target - inventory_position)
-        period_order_qty[t] = order_qty
+    total_sales = total_demand - total_stockout
+    gross_profit = total_sales * UNIT_MARGIN
+    total_stockout_loss = total_stockout * UNIT_STOCKOUT_PENALTY
+    total_holding_cost = np.sum(holding_costs_arr)
+    total_logistics_cost = DAYS * freq * DELIVERY_COST
 
-        # 记录到未来交付窗口 (L个周期后送达)
-        in_transit[t + lead_time_periods] = order_qty
+    net_profit = gross_profit - total_stockout_loss - total_holding_cost - total_logistics_cost
+    over_capacity_days = np.sum(inventory_levels > MAX_CAPACITY)
+    warning_days = np.sum((inventory_levels > 683) & (inventory_levels <= 800))
 
-    # 将周期级离散数据聚合成 365 天的日级大盘数据
-    daily_df = pd.DataFrame({
-        "Day": np.arange(1, total_days + 1),
-        "Demand": [sum(period_demand[i*f:(i+1)*f]) for i in range(total_days)],
-        "Sales": [sum(period_sales[i*f:(i+1)*f]) for i in range(total_days)],
-        "Stockout": [sum(period_stockout[i*f:(i+1)*f]) for i in range(total_days)],
-        "Avg_Inventory": [np.mean(period_ending_inventory[i*f:(i+1)*f]) * f for i in range(total_days)], # 折算日平均实物库存
-        "Holding_Cost": [sum(period_holding_cost[i*f:(i+1)*f]) for i in range(total_days)]
-    })
+    return {
+        "inventory_levels": inventory_levels,
+        "net_profit": net_profit,
+        "actual_sl": actual_sl,
+        "total_holding_cost": total_holding_cost,
+        "over_capacity_days": over_capacity_days,
+        "warning_days": warning_days
+    }
 
-    return daily_df
-
-# 运行仿真引擎
-df_sim = run_inventory_simulation(target_sl, replenish_freq, weekend_volatility, random_seed)
+# 运行仿真
+results = run_simulation(target_sl, f, extreme_volatility)
 
 # ==========================================
-# 5. 核心运营指标结算中心 (KPI 看板)
+# 3. 仪表盘 UI 渲染与可视化
 # ==========================================
-total_sales_revenue = df_sim["Sales"].sum() * UNIT_MARGIN
-total_holding_cost = df_sim["Holding_Cost"].sum()
-total_stockout_penalty = df_sim["Stockout"].sum() * STOCKOUT_PENALTY
-total_logistics_cost = 365 * replenish_freq * COST_PER_DELIVERY
-
-# 计算最高决策指标：年度总利润
-annual_profit = total_sales_revenue - total_holding_cost - total_stockout_penalty - total_logistics_cost
-# 计算实际达成的订单满足率
-actual_service_level = df_sim["Sales"].sum() / df_sim["Demand"].sum()
-# 计算平均周转率 (销售总量 / 日均库存)
-avg_inv_level = df_sim["Avg_Inventory"].mean()
-inventory_turnover = df_sim["Sales"].sum() / max(1.0, avg_inv_level)
-# 计算爆仓与高损耗发生的频率天数
-warning_days = (df_sim["Avg_Inventory"] > WARNING_LIMIT).sum()
-
-# 渲染前端 KPI 卡片
+# 顶部 KPI 指标卡片
 col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("💰 年度最终总利润", f"￥{annual_profit:,.2f}",
-              help="扣除所有非线性损耗、缺货惩罚、物流运费后的核心真实净利润")
-with col2:
-    st.metric("🎯 实际订单满足率 (SL)", f"{actual_service_level * 100:.2f}%",
-              delta=f"{(actual_service_level - target_sl)*100:.2f}% 基准偏差")
-with col3:
-    st.metric("📦 全年总持有成本 (损耗)", f"￥{total_holding_cost:,.2f}", help="包含进入黄线和红线区段后的加权惩罚")
-with col4:
-    st.metric("⚠️ 高损耗与爆仓天数", f"{warning_days} 天", f"占比 {(warning_days/365)*100:.1f}%")
+col1.metric("年度综合净利润 (元)", f"¥{results['net_profit']:,.0f}")
+col2.metric("实际达成服务水平", f"{results['actual_sl']*100:.2f}%", delta=f"{results['actual_sl'] - target_sl:.2%} 偏差")
+col3.metric("年总持有成本 (元)", f"¥{results['total_holding_cost']:,.0f}")
+col4.metric("严重爆仓天数 (>800件)", f"{results['over_capacity_days']} 天", delta_color="inverse")
 
-# ==========================================
-# 6. 数据可视化大屏 (库存随时间波动图)
-# ==========================================
-st.subheader("📈 365天全景实物库存波形演轨迹")
+st.markdown("---")
 
-fig = go.Figure()
+# 中间核心图表：全年库存动态波动图
+st.subheader("全年期末库存动态波动轨迹 (365天)")
 
-# 绘制库存主折线
-fig.add_trace(go.Scatter(
-    x=df_sim["Day"], y=df_sim["Avg_Inventory"],
-    mode='lines', name='当日平均实物库存',
-    line=dict(color='#2b5c8f', width=2)
-))
+fig, ax = plt.subplots(figsize=(15, 5))
+ax.plot(results['inventory_levels'], color='#1f77b4', linewidth=1.5, alpha=0.8, label="每日期末库存")
 
-# 绘制物理限制红线
-fig.add_shape(type="line", x0=1, y0=CAPACITY_LIMIT, x1=365, y1=CAPACITY_LIMIT,
-              line=dict(color="Red", width=2, dash="dashdot"))
-fig.add_trace(go.Scatter(x=[15], y=[CAPACITY_LIMIT + 20], text=["物理限制上限 (800件)"], mode="text", name="红线", showlegend=False))
+# 添加物理极限与预警线
+ax.axhline(y=800, color='red', linestyle='--', linewidth=2, label="物理库容极限 (800件) - 触发35%最高损耗")
+ax.axhline(y=683, color='orange', linestyle=':', linewidth=2, label="运营预警线 (683件) - 触发30%较高损耗")
 
-# 绘制生物学预警黄线
-fig.add_shape(type="line", x0=1, y0=WARNING_LIMIT, x1=365, y1=WARNING_LIMIT,
-              line=dict(color="Orange", width=2, dash="dash"))
-fig.add_trace(go.Scatter(x=[15], y=[WARNING_LIMIT - 20], text=["安全预警边界 (683件)"], mode="text", name="黄线", showlegend=False))
+ax.fill_between(range(DAYS), 800, results['inventory_levels'], where=(results['inventory_levels'] > 800), color='red', alpha=0.3)
+ax.fill_between(range(DAYS), 683, 800, where=((results['inventory_levels'] > 683) & (results['inventory_levels'] <= 800)), color='orange', alpha=0.2)
 
-fig.update_layout(
-    xaxis_title="模拟天数 (Day 1 - Day 365)",
-    yaxis_title="实物在库件数 (Units)",
-    hovermode="x unified",
-    margin=dict(l=40, r=40, t=20, b=40),
-    height=450
-)
-st.plotly_chart(fig, use_container_width=True)
+ax.set_xlabel("天数 (Day)", fontsize=12)
+ax.set_ylabel("库存件数 (Units)", fontsize=12)
+ax.set_title(f"库存波动轨迹仿真 | 目标SL: {target_sl*100:.1f}% | 频率: {f}次/天", fontsize=14)
+ax.legend(loc="upper right")
+ax.grid(True, alpha=0.3)
 
-# ==========================================
-# 7. Final 汇报专供：深度量化洞察报告文本
-# ==========================================
-st.subheader("📝 决策机制解释与风险失效分析 (PPT摘要直通车)")
+st.pyplot(fig)
 
-# 动态提取动态生成的特性，赋予报表高度智能感
-insight_level = "极高风险" if target_sl >= 0.97 else ("健康稳健" if target_sl == 0.95 and replenish_freq == 3 else "次优区间")
-
-st.info(f"""
-**1️⃣ 决策机制与长期绩效解释 (How it works):**
-* 仿真引擎以周期步长连续推演证明：将补货频次提升至 **f=3次/天** 时，由于在途时间缩短、单次补货批量变小，能够使日常库存水位非常稳定地贴着 **{WARNING_LIMIT}件** 的安全边界波动。这完美对齐了展示2的静态求解成果。
-
-**2️⃣ 需求不确定性的反噬机制 (The Hint Cost):**
-* 当前设定的目标服务水平为 **{target_sl*100:.1f}%**。当开启压力测试后，周末的剧烈需求变异会强制系统拉高订货量。
-* 如果你盲目将滑块拖动到 **97% 以上**，你会发现右侧的"高损耗天数"陡然上升。这是因为安全库存直接顶破了物理边界，频繁触发 **35% 惩罚性损耗**，导致利润出现非线性急剧失血。
-
-**3️⃣ 战略风险边界与失效条件 (When it fails):**
-* **条件 A (容量刚性失效)**：若不扩大现有门店的仓储容量（死卡800件限制），当市场波动标准差 $\\sigma$ 进一步放大 **1.5倍** 时，现有策略将彻底失效，系统将陷入"周末严重断货 -> 周一疯狂补货导致爆仓"的恶性振荡。
-* **条件 B (物流延迟恶化)**：若物流配送前置时间 $L$ 从当前的1天延长至2天，本系统的动态库存保护期将拉长，库存轨迹将全面击穿红线，企业必须主动降级服务水平至 **92%** 实施战略防御。
-""")
+# 底部诊断与决策建议
+st.subheader("💡 仿真诊断报告")
+if results['over_capacity_days'] > 20:
+    st.error(f"**高风险警告：** 当前策略导致全年发生 **{results['over_capacity_days']}** 天爆仓。盲目追求过高的目标服务水平（{target_sl*100}%），在面对极端不确定性时，非线性惩罚成本已经严重吞噬利润。建议降低服务水平目标，或实施动态补货调控！")
+elif results['warning_days'] > 50:
+    st.warning(f"**运营承压：** 处于黄色预警区间（高损耗）的天数高达 **{results['warning_days']}** 天，虽然未严重爆仓，但门店运营缓冲极低。")
+else:
+    st.success("**系统健康：** 当前参数组合在应对需求波动时表现稳健，既保证了良好的顾客体验，又完美规避了爆仓引发的非线性损耗。")
